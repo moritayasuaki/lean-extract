@@ -1,6 +1,9 @@
 name: extract-mathlib
 
 on:
+  push:
+    branches: [main]
+    paths: ["requests/mathlib.json"]
   workflow_dispatch:
     inputs:
       pass:
@@ -18,8 +21,34 @@ defaults:
     working-directory: mathlib
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      pass: ${{ steps.m.outputs.pass }}
+      shards: ${{ steps.m.outputs.shards }}
+      count: ${{ steps.m.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        working-directory: .
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          req = {}
+          if os.environ["EV"] == "push" and os.path.exists("requests/mathlib.json"):
+              req = json.load(open("requests/mathlib.json"))
+          p = os.environ.get("IN_PASS") or req.get("pass", "both")
+          n = int(os.environ.get("IN_SHARDS") or req.get("shards", 16))
+          print(f"pass={p}"); print(f"count={n}"); print("shards=" + json.dumps(list(range(n))))
+          PY
+        env:
+          EV: ${{ github.event_name }}
+          IN_PASS: ${{ inputs.pass }}
+          IN_SHARDS: ${{ inputs.shards }}
+
   decls:
-    if: inputs.pass != 'steps'
+    needs: plan
+    if: needs.plan.outputs.pass != 'steps'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -46,18 +75,9 @@ jobs:
           name: decls
           path: mathlib/decls.jsonl.gz
 
-  plan:
-    if: inputs.pass != 'decls'
-    runs-on: ubuntu-latest
-    outputs:
-      shards: ${{ steps.m.outputs.shards }}
-    steps:
-      - id: m
-        working-directory: .
-        run: echo "shards=$(python3 -c "import json; print(json.dumps(list(range(int('${{ inputs.shards }}')))))")" >> "$GITHUB_OUTPUT"
-
   steps:
     needs: plan
+    if: needs.plan.outputs.pass != 'decls'
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
@@ -80,7 +100,7 @@ jobs:
         run: lake build steps
       - name: Pass 2, proof steps of the target theorems
         run: |
-          python3 ../scripts/shard.py targets.json ${{ inputs.shards }} ${{ matrix.shard }} > shard-${{ matrix.shard }}.json
+          python3 ../scripts/shard.py targets.json ${{ needs.plan.outputs.count }} ${{ matrix.shard }} > shard-${{ matrix.shard }}.json
           lake exe steps .lake/packages/mathlib shard-${{ matrix.shard }}.json steps-${{ matrix.shard }}.json
       - uses: actions/upload-artifact@v4
         with:
@@ -88,7 +108,7 @@ jobs:
           path: mathlib/steps-${{ matrix.shard }}.json
 
   publish:
-    needs: [decls, steps]
+    needs: [plan, decls, steps]
     if: always() && (needs.decls.result == 'success' || needs.steps.result == 'success')
     runs-on: ubuntu-latest
     steps:
@@ -110,4 +130,4 @@ jobs:
           ls -la release
           gh release create "mathlib-${{ github.run_number }}" release/* \
             --title "Extraction run ${{ github.run_number }}" \
-            --notes "Mathlib rev $(grep -o '[0-9a-f]\{40\}' mathlib/lakefile.toml). Pass: ${{ inputs.pass }}."
+            --notes "Mathlib rev $(grep -o '[0-9a-f]\{40\}' mathlib/lakefile.toml). Pass: ${{ needs.plan.outputs.pass }}."
