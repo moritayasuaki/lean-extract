@@ -1,0 +1,113 @@
+name: extract-mathlib
+
+on:
+  workflow_dispatch:
+    inputs:
+      pass:
+        description: "decls, steps or both"
+        default: "both"
+      shards:
+        description: "number of parallel jobs for the steps pass"
+        default: "16"
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: mathlib
+
+jobs:
+  decls:
+    if: inputs.pass != 'steps'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        working-directory: .
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost; df -h /
+      - name: Install elan
+        working-directory: .
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Get Mathlib's compiled files
+        run: lake exe cache get
+      - name: Build the extractor
+        run: lake build extract
+      - name: Pass 1, every declaration
+        run: |
+          /usr/bin/time -v lake exe extract Mathlib Mathlib decls.jsonl 4 full
+          wc -l decls.jsonl
+          gzip -9 decls.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decls
+          path: mathlib/decls.jsonl.gz
+
+  plan:
+    if: inputs.pass != 'decls'
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+    steps:
+      - id: m
+        working-directory: .
+        run: echo "shards=$(python3 -c "import json; print(json.dumps(list(range(int('${{ inputs.shards }}')))))")" >> "$GITHUB_OUTPUT"
+
+  steps:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        working-directory: .
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost; df -h /
+      - name: Install elan
+        working-directory: .
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Get Mathlib's compiled files
+        run: lake exe cache get
+      - name: Build the step reader
+        run: lake build steps
+      - name: Pass 2, proof steps of the target theorems
+        run: |
+          python3 ../scripts/shard.py targets.json ${{ inputs.shards }} ${{ matrix.shard }} > shard-${{ matrix.shard }}.json
+          lake exe steps .lake/packages/mathlib shard-${{ matrix.shard }}.json steps-${{ matrix.shard }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: steps-${{ matrix.shard }}
+          path: mathlib/steps-${{ matrix.shard }}.json
+
+  publish:
+    needs: [decls, steps]
+    if: always() && (needs.decls.result == 'success' || needs.steps.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Merge and release
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release
+          if ls out/steps-*/steps-*.json >/dev/null 2>&1; then
+            python3 scripts/merge.py release/steps.json out/steps-*/steps-*.json
+            gzip -9 release/steps.json
+          fi
+          if [ -f out/decls/decls.jsonl.gz ]; then cp out/decls/decls.jsonl.gz release/; fi
+          ls -la release
+          gh release create "mathlib-${{ github.run_number }}" release/* \
+            --title "Extraction run ${{ github.run_number }}" \
+            --notes "Mathlib rev $(grep -o '[0-9a-f]\{40\}' mathlib/lakefile.toml). Pass: ${{ inputs.pass }}."

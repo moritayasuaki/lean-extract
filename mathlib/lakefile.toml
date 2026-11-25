@@ -1,0 +1,18 @@
+name = "lean_extract_mathlib"
+srcDir = "../src"
+defaultTargets = ["extract", "steps"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "0df444a360eaa60ab8c11dca51a86af692955474"
+
+[[lean_exe]]
+name = "extract"
+root = "Extract"
+supportInterpreter = true
+
+[[lean_exe]]
+name = "steps"
+root = "Steps"
+supportInterpreter = true
