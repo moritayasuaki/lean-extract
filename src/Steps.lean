@@ -2,7 +2,9 @@
 Pass 2: elaborate source files and record every tactic step inside chosen declarations:
 the tactic's text and position, and the goals before and after it (pretty-printed).
 
-Usage:  lake exe steps ROOT TARGETS.json OUT.json
+Usage:  lake exe steps ROOT TARGETS.json OUT.json [OPTIONS]
+  OPTIONS       comma-separated Lean options used to build the library, for example
+                `autoImplicit=false,maxSynthPendingDepth=3` (true/false or a number)
   ROOT          directory the target file paths are relative to (for example the Mathlib checkout)
   TARGETS.json  [{"file": "Mathlib/Algebra/Ring/Defs.lean", "name": "two_mul", "line": 182, "n": 2}, ...]
                 line = first line of the declaration (1-based), n = number of lines
@@ -26,14 +28,28 @@ def ppGoals (ci : ContextInfo) (mctx : MetavarContext) (gs : List MVarId) : IO (
       gs.toArray.mapM fun g => return toString (← ppGoal g)
   catch _ => return #[]
 
-def stepsOfFile (root : String) (file : String) (targets : Array Target) : IO Json := do
+def parseOptions (spec : String) : Options := Id.run do
+  let mut o : Options := {}
+  for kv in (spec.replace " " "").splitOn "," do
+    match kv.splitOn "=" with
+    | [k, v] =>
+      let key := k.toName
+      if v == "true" then o := o.set key true
+      else if v == "false" then o := o.set key false
+      else match v.toNat? with
+        | some n => o := o.set key n
+        | none => o := o.set key v
+    | _ => pure ()
+  return o
+
+unsafe def stepsOfFile (root : String) (opts : Options) (file : String) (targets : Array Target) : IO Json := do
   let path := System.FilePath.mk root / file
   let input ← IO.FS.readFile path
   let inputCtx := Parser.mkInputContext input path.toString
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
   let modName := ((file.replace ".lean" "").replace "/" ".").toName
-  let (env, messages) ← processHeader header {} messages inputCtx (trustLevel := 1024) (mainModule := modName)
-  let cmdState := { Command.mkState env messages {} with infoState.enabled := true }
+  let (env, messages) ← processHeader header opts messages inputCtx (trustLevel := 1024) (mainModule := modName)
+  let cmdState := { Command.mkState env messages opts with infoState.enabled := true }
   let s ← IO.processCommands inputCtx parserState cmdState
   let fmap := inputCtx.fileMap
   -- collect every tactic node with its context
@@ -59,14 +75,19 @@ def stepsOfFile (root : String) (file : String) (targets : Array Target) : IO Js
         ("k", toJson ti.stx.getKind.toString), ("s", toJson text),
         ("b", toJson before), ("a", toJson after)]
     perTarget := perTarget.push (tg.name, Json.arr steps)
-  let errs := s.commandState.messages.toList.filter (·.severity == .error) |>.length
-  if errs > 0 then IO.eprintln s!"{file}: {errs} errors while elaborating"
+  let errs := s.commandState.messages.toList.filter (·.severity == .error)
+  if errs.length > 0 then
+    IO.eprintln s!"{file}: {errs.length} errors while elaborating"
+    for m in errs.take 2 do
+      IO.eprintln s!"  {m.pos.line}: {(← m.data.toString).take 300}"
+  s.commandState.env.freeRegions
   return Json.mkObj (perTarget.toList)
 
 unsafe def main (args : List String) : IO UInt32 := do
   let root := args.getD 0 "."
   let targetsPath := args.getD 1 "targets.json"
   let out := args.getD 2 "steps.json"
+  let opts := parseOptions (args.getD 3 "")
   initSearchPath (← findSysroot)
   enableInitializersExecution
   let raw ← IO.FS.readFile targetsPath
@@ -79,7 +100,7 @@ unsafe def main (args : List String) : IO UInt32 := do
     k := k + 1
     IO.eprintln s!"[{k}/{files.size}] {f}"
     try
-      let j ← stepsOfFile root f (targets.filter (·.file == f))
+      let j ← stepsOfFile root opts f (targets.filter (·.file == f))
       result := result.push (f, j)
     catch e => IO.eprintln s!"failed {f}: {e}"
   IO.FS.writeFile out (Json.mkObj result.toList).compress
