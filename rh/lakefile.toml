@@ -1,0 +1,8 @@
+name = "lean_extract_rh"
+srcDir = "../src"
+defaultTargets = ["readolean"]
+
+[[lean_exe]]
+name = "readolean"
+root = "ReadOlean"
+supportInterpreter = true

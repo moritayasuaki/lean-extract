@@ -1,0 +1,121 @@
+name: extract-rh
+
+# Structure only: names, kinds, modules and which declarations use which.
+# The archive has no licence, so no statements, proofs or docstrings are published.
+
+on:
+  push:
+    branches: [main]
+    paths: ["requests/rh.json"]
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "number of parallel jobs"
+        default: "20"
+      ref:
+        description: "archive branch or commit"
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-rh
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+      count: ${{ steps.m.outputs.count }}
+      ref: ${{ steps.m.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          req = {}
+          if os.environ["EV"] == "push" and os.path.exists("requests/rh.json"):
+              req = json.load(open("requests/rh.json"))
+          n = int(os.environ.get("IN_SHARDS") or req.get("shards", 20))
+          ref = os.environ.get("IN_REF") or req.get("ref", "main")
+          print(f"count={n}"); print(f"ref={ref}"); print("shards=" + json.dumps(list(range(n))))
+          PY
+        env:
+          EV: ${{ github.event_name }}
+          IN_SHARDS: ${{ inputs.shards }}
+          IN_REF: ${{ inputs.ref }}
+      - name: Fetch the archive's build configuration (no source files)
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/leanprover-community/riemann-hypothesis archive
+          cd archive
+          git sparse-checkout set --no-cone '/*' '!/src/'
+          git checkout ${{ steps.m.outputs.ref }}
+          git log -1 --format='%H %cd'
+      - name: List compiled modules from the archive's public cache
+        run: python3 scripts/rh_modules.py archive modules.json
+      - name: Pin our reader to the archive's Lean version
+        run: cp archive/lean-toolchain rh/lean-toolchain && cat rh/lean-toolchain
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: |
+            modules.json
+            rh/lean-toolchain
+
+  read:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+      - name: Install elan and the archive's Lean version
+        run: |
+          cp plan/rh/lean-toolchain rh/lean-toolchain
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Build the reader
+        working-directory: rh
+        run: lake build readolean
+      - name: Read this shard's modules
+        working-directory: rh
+        run: |
+          LEANTAR="$(dirname "$(elan which lean)")/leantar"
+          python3 ../scripts/rh_shard.py ../plan/modules.json ${{ needs.plan.outputs.count }} ${{ matrix.shard }} \
+            "$LEANTAR" .lake/build/bin/readolean structure-${{ matrix.shard }}.jsonl
+          gzip -9 structure-${{ matrix.shard }}.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: structure-${{ matrix.shard }}
+          path: rh/structure-${{ matrix.shard }}.jsonl.gz
+
+  publish:
+    needs: [plan, read]
+    if: always() && needs.read.result != 'skipped' && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Merge and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release
+          cat out/structure-*/structure-*.jsonl.gz > release/structure.jsonl.gz
+          python3 -c "import gzip; print(sum(1 for _ in gzip.open('release/structure.jsonl.gz')), 'modules')"
+          HEAD=$(python3 -c "import json; print(json.load(open('out/plan/modules.json'))['candidate_head'])")
+          gh release create "rh-${{ github.run_number }}" release/* \
+            --title "Archive structure, run ${{ github.run_number }}" \
+            --notes "Structure only (names, kinds, modules, uses) of leanprover-community/riemann-hypothesis at cache record ${HEAD}. The archive has no licence; no statements, proofs or docstrings are included."
