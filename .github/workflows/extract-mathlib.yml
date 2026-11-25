@@ -105,7 +105,7 @@ jobs:
       - name: Pass 2, proof steps of the target theorems
         run: |
           python3 ../scripts/shard.py targets.json ${{ needs.plan.outputs.count }} ${{ matrix.shard }} > shard-${{ matrix.shard }}.json
-          lake exe steps .lake/packages/mathlib shard-${{ matrix.shard }}.json steps-${{ matrix.shard }}.json "autoImplicit=false,maxSynthPendingDepth=3,pp.unicode.fun=true,Elab.async=false"
+          lake env python3 ../scripts/run_steps.py .lake/build/bin/steps .lake/packages/mathlib shard-${{ matrix.shard }}.json steps-${{ matrix.shard }}.json "autoImplicit=false,maxSynthPendingDepth=3,pp.unicode.fun=true,Elab.async=false"
       - uses: actions/upload-artifact@v4
         with:
           name: steps-${{ matrix.shard }}

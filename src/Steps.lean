@@ -80,7 +80,6 @@ unsafe def stepsOfFile (root : String) (opts : Options) (file : String) (targets
     IO.eprintln s!"{file}: {errs.length} errors while elaborating"
     for m in errs.take 2 do
       IO.eprintln s!"  {m.pos.line}: {(← m.data.toString).take 300}"
-  s.commandState.env.freeRegions
   return Json.mkObj (perTarget.toList)
 
 unsafe def main (args : List String) : IO UInt32 := do
